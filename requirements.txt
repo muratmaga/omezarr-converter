@@ -1,0 +1,4 @@
+numpy
+tifffile
+imagecodecs
+zarr>=3
