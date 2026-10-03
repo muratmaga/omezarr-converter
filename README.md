@@ -19,14 +19,17 @@ python stack_to_omezarr.py Scan_0006_Rec Scan_0006.ome.zarr
 python stack_to_omezarr.py slices/ specimen.ome.zarr --voxel-size 12.5
 
 # rebuild the levels of an existing store into a new one (level 0, axes, origin kept)
-python stack_to_omezarr.py old.ome.zarr new.ome.zarr --unsharded
+python stack_to_omezarr.py old.ome.zarr new.ome.zarr
+
+# group the chunks into 384³ shards (fewer files, for very large volumes or object storage)
+python stack_to_omezarr.py Scan_0006_Rec Scan_0006.ome.zarr --shard 384
 ```
 
 | Option | Default | |
 |---|---|---|
 | `--levels` | 4 | resolution levels, full resolution included |
 | `--voxel-size` | from the log | micrometres, isotropic |
-| `--unsharded` | off | one object per 128³ chunk instead of 512³ shards |
+| `--shard` | 128 | shard size in voxels per side, a multiple of 128. At 128 every 128³ chunk is its own file (no shards) |
 | `--threads` | 8 | threads reading slices |
 | `--no-verify` | off | skip the check against the source |
 
@@ -37,7 +40,10 @@ check exits with `VERIFY FAILED`.
 ## Output
 
 - OME-Zarr 0.5 (Zarr v3). Each level is one array at `scale{k}/<name>`, in z, y, x order.
-- 128³ chunks grouped into 512³ shards, compressed with zstd. Chunks that are all zero are not written.
+- 128³ chunks, compressed with zstd. Chunks that are all zero are not written.
+- With `--shard N` the chunks are grouped into N³ shards: one file per shard instead of one per
+  chunk. Shards matter when the store goes to object storage (each file read is one request) or
+  sits on a network drive or a synced folder. On a local disk plain chunks are the simpler choice.
 - Millimetre units. The origin is 0 and the orientation is identity LPS, because a slice folder carries neither.
 - Scan settings are stored in the group attribute `acquisition`.
 
@@ -49,9 +55,10 @@ even). Every coarse voxel is therefore within 0.5 gray level of the true mean, w
 8-bit data. Building each level from the one above it would round at every step, reaching about
 ±1 gray level by level 3.
 
-This costs no extra reading. The source is read once, in 512-slice slabs, and every level is
-built from the slab in memory. Peak memory is about one slab plus a coarse-level buffer: near
-11 GB for a 1908 × 2596 × 3882 16-bit volume (38 GB raw), which converted in about 2 minutes.
+This costs no extra reading. The source is read once, in slabs as deep as the shard (128 slices
+by default), and every level is built from the slab in memory. Peak memory is about one slab
+plus a coarse-level buffer, so larger shards need more memory. With 512³ shards a
+1908 × 2596 × 3882 16-bit volume (38 GB raw) peaked near 11 GB and converted in about 2 minutes.
 
 Each level's voxel centre sits (2^k − 1)/2 level-0 voxels in from the origin, and the
 `translation` of each level records this. Every level therefore lines up in physical space.
@@ -63,5 +70,6 @@ python -m pytest test_stack_to_omezarr.py   # or: python test_stack_to_omezarr.p
 ```
 
 The tests build synthetic 8-bit and 16-bit stacks, including odd sizes and a stack that crosses
-a 512-slice slab. They check every coarse level against the exactly rounded mean, and check that
-rebuilding from a store gives identical levels and keeps its metadata.
+several slabs, with and without shards. They check every coarse level against the exactly rounded
+mean, and check that rebuilding from a store in the other layout gives identical levels and keeps
+its metadata.

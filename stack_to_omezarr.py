@@ -2,8 +2,8 @@
 """Convert a microCT TIFF reconstruction (a folder of 2D slices) into a multiscale OME-Zarr store,
 or rebuild the coarser levels of an existing OME-Zarr store from its full-resolution level.
 
-    stack_to_omezarr.py <slice folder> <out.ome.zarr> [--levels 4] [--voxel-size UM]
-    stack_to_omezarr.py <in.ome.zarr> <out.ome.zarr> [--levels 4] [--unsharded]
+    stack_to_omezarr.py <slice folder> <out.ome.zarr> [--levels 4] [--voxel-size UM] [--shard 128]
+    stack_to_omezarr.py <in.ome.zarr> <out.ome.zarr> [--levels 4] [--shard 128]
 
 Bruker/SkyScan NRecon folders are read as they are: the voxel size, slice range and file names
 come from the *_rec.log, and the scan settings are written into the store. Any other folder of
@@ -11,20 +11,22 @@ single-page TIFFs works with --voxel-size (micrometres; slices are taken in name
 An existing store keeps its level 0, axes, scale, origin and other attributes; only the
 coarser levels are recomputed (its level 0 must be a z, y, x array).
 
-The store is OME-Zarr 0.5 (Zarr v3): one array per level at scale{k}/<name>, 128^3 chunks
-grouped in 512^3 shards, zstd, millimetre units, origin 0 and identity LPS orientation.
+The store is OME-Zarr 0.5 (Zarr v3): one array per level at scale{k}/<name>, 128^3 chunks, zstd,
+millimetre units, origin 0 and identity LPS orientation. --shard N groups the chunks into N^3
+shards (N a multiple of 128); the default, 128, writes every chunk as its own file.
 
 Every level is the block mean of the SOURCE voxels it covers (2^k per axis), summed exactly and
 rounded once (half to even) for integer data. Level k is not computed from level k-1: rounding
 once keeps every coarse voxel within 0.5 gray level of the true mean, which matters for 8-bit
 data, and costs no extra reading because all levels are built from the source slab in memory.
 
-Memory: about one 512-slice slab of the source plus a coarse-level buffer (the 38 GB, 3882-slice
-skull peaked near 11 GB). The source is read once.
+Memory: about one slab of the source, as deep as the shard, plus a coarse-level buffer (with 512^3
+shards the 38 GB, 3882-slice skull peaked near 11 GB). The source is read once.
 """
 import argparse
 import configparser
 import glob
+import math
 import os
 import sys
 import time
@@ -35,7 +37,7 @@ import tifffile
 import zarr
 from zarr.codecs import ZstdCodec
 
-CHUNK, SHARD = 128, 512
+CHUNK = 128
 ORIENTATION = {"x": "right-to-left", "y": "anterior-to-posterior", "z": "inferior-to-superior"}
 
 
@@ -162,8 +164,11 @@ class StoreSource:
         return self.array[z]
 
 
-def convert(source, out, levels=4, sharded=True, log=print):
-    """Write ``source`` (StackSource or StoreSource) to ``out`` with ``levels`` levels."""
+def convert(source, out, levels=4, shard=CHUNK, log=print):
+    """Write ``source`` (StackSource or StoreSource) to ``out`` with ``levels`` levels, chunks grouped in
+    ``shard``^3 shards (``shard`` == CHUNK: no shards, one file per chunk)."""
+    if shard < CHUNK or shard % CHUNK:
+        raise ValueError(f"shard size {shard} is not a multiple of the {CHUNK}-voxel chunk")
     name, dtype = source.name, source.dtype
     log(f"{name}: {source.shape[2]}x{source.shape[1]}x{source.shape[0]} {dtype}, {source.description}, {levels} levels")
     shapes = [tuple(n // 2**k for n in source.shape) for k in range(levels)]
@@ -172,7 +177,7 @@ def convert(source, out, levels=4, sharded=True, log=print):
     for k, shape in enumerate(shapes):
         group = root.create_group(f"scale{k}")
         group.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
-        layout = {"chunks": (CHUNK,) * 3, "shards": (SHARD,) * 3} if sharded else {"chunks": (CHUNK,) * 3}
+        layout = {"chunks": (CHUNK,) * 3, "shards": (shard,) * 3} if shard > CHUNK else {"chunks": (CHUNK,) * 3}
         arrays.append(
             group.create_array(
                 name, shape=shape, dtype=dtype, compressors=ZstdCodec(level=3), fill_value=0,
@@ -208,7 +213,8 @@ def convert(source, out, levels=4, sharded=True, log=print):
 
     pending = [[] for _ in range(levels)]  # coarse slices waiting to fill a row of shards
     written = [0] * levels
-    rows = SHARD  # a multiple of every 2^k, so blocks never straddle slabs
+    # whole shards per write, and a multiple of every 2^k so blocks never straddle slabs
+    rows = math.lcm(shard, 2 ** (levels - 1))
 
     def flush(k, final=False):
         data = np.concatenate(pending[k]) if pending[k] else None
@@ -271,16 +277,19 @@ def main():
     parser.add_argument("--levels", type=int, default=4, help="resolution levels including full resolution (default 4)")
     parser.add_argument("--voxel-size", type=float, help="voxel size in micrometres (overrides the log)")
     parser.add_argument("--threads", type=int, default=8, help="threads reading slices (default 8)")
-    parser.add_argument("--unsharded", action="store_true", help="plain 128^3 chunk objects instead of 512^3 shards")
+    parser.add_argument("--shard", type=int, default=CHUNK,
+                        help=f"shard size in voxels per side, a multiple of {CHUNK} (default {CHUNK}: no shards, one file per chunk)")
     parser.add_argument("--no-verify", action="store_true", help="skip the check against the source")
     args = parser.parse_args()
+    if args.shard < CHUNK or args.shard % CHUNK:
+        parser.error(f"--shard must be a multiple of {CHUNK}")
     if os.path.samefile(args.folder, args.out) if os.path.exists(args.out) else False:
         sys.exit("write to a new store: the source is read while the output is written")
     if os.path.exists(os.path.join(args.folder, "zarr.json")):
         source = StoreSource(args.folder)
     else:
         source = StackSource(args.folder, args.voxel_size, args.threads)
-    convert(source, args.out, args.levels, sharded=not args.unsharded)
+    convert(source, args.out, args.levels, shard=args.shard)
     if not args.no_verify and not verify(args.out, source, args.levels):
         sys.exit("VERIFY FAILED")
     print("DONE")
