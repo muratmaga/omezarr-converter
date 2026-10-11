@@ -40,14 +40,15 @@ def make_stack(folder, dtype, shape, seed=0):
     return volume
 
 
-def check(dtype, shape, levels=4):
+def check(dtype, shape, levels=4, shard=conv.CHUNK):
     with tempfile.TemporaryDirectory() as tmp:
         source = os.path.join(tmp, "synthetic_Rec")
         os.mkdir(source)
         volume = make_stack(source, dtype, shape)
         out = os.path.join(tmp, "synthetic.ome.zarr")
         stack = conv.StackSource(source)
-        conv.convert(stack, out, levels=levels, log=lambda *a: None)
+        conv.convert(stack, out, levels=levels, shard=shard, log=lambda *a: None)
+        assert zarr.open_array(out, path=f"scale0/{stack.name}").shards == ((shard,) * 3 if shard > conv.CHUNK else None)
         name = stack.name
         assert name == "synthetic"
         group = zarr.open_group(out, mode="r")
@@ -65,21 +66,44 @@ def check(dtype, shape, levels=4):
         assert group.attrs["acquisition"]["voxel_size_um"] == 6.12669
         assert conv.verify(out, stack, levels, log=lambda *a: None)
 
-        # Rebuilding from the store itself (plain chunks this time) gives the same levels and keeps its metadata.
+        # Rebuilding from the store itself (the other layout this time) gives the same levels and keeps its metadata.
         again = os.path.join(tmp, "again.ome.zarr")
         store = conv.StoreSource(out)
-        conv.convert(store, again, levels=levels, sharded=False, log=lambda *a: None)
+        other = 384 if shard == conv.CHUNK else conv.CHUNK
+        conv.convert(store, again, levels=levels, shard=other, log=lambda *a: None)
         rebuilt = zarr.open_group(again, mode="r")
         for k in range(levels):
             np.testing.assert_array_equal(rebuilt[f"scale{k}/{name}"][:], group[f"scale{k}/{name}"][:])
         assert rebuilt.attrs["ome"]["multiscales"][0]["datasets"] == ms["datasets"]
         assert rebuilt.attrs["acquisition"] == group.attrs["acquisition"]
-        assert "sharding_indexed" not in str(rebuilt[f"scale0/{name}"].metadata.codecs)
+        assert rebuilt[f"scale0/{name}"].shards == ((other,) * 3 if other > conv.CHUNK else None)
         assert conv.verify(again, store, levels, log=lambda *a: None)
 
 
 def test_uint8_odd_shape():
-    check(np.uint8, (523, 37, 41))  # crosses a 512-slice slab; odd sizes drop trailing partial blocks
+    check(np.uint8, (523, 37, 41))  # crosses 128-slice slabs; odd sizes drop trailing partial blocks
+
+
+def test_sharded():
+    check(np.uint8, (523, 37, 41), shard=512)  # crosses a 512-slice slab
+
+
+def test_default_shard():
+    with tempfile.TemporaryDirectory() as tmp:
+        source = os.path.join(tmp, "synthetic_Rec")
+        os.mkdir(source)
+        make_stack(source, np.uint16, (20, 30, 25))
+        out = os.path.join(tmp, "synthetic.ome.zarr")
+        conv.convert(conv.StackSource(source), out, levels=2, log=lambda *a: None)
+        assert zarr.open_array(out, path="scale0/synthetic").shards == (conv.DEFAULT_SHARD,) * 3 == (384,) * 3
+
+
+def test_bad_shard():
+    try:
+        conv.convert(None, "unused", shard=200)
+    except ValueError:
+        return
+    raise AssertionError("shard 200 accepted")
 
 
 def test_uint16():
@@ -88,5 +112,8 @@ def test_uint16():
 
 if __name__ == "__main__":
     test_uint8_odd_shape()
+    test_sharded()
+    test_default_shard()
+    test_bad_shard()
     test_uint16()
     print("all passed")
