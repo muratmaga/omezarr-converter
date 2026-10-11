@@ -2,8 +2,8 @@
 """Convert a microCT TIFF reconstruction (a folder of 2D slices) into a multiscale OME-Zarr store,
 or rebuild the coarser levels of an existing OME-Zarr store from its full-resolution level.
 
-    stack_to_omezarr.py <slice folder> <out.ome.zarr> [--levels 4] [--voxel-size UM] [--shard 128]
-    stack_to_omezarr.py <in.ome.zarr> <out.ome.zarr> [--levels 4] [--shard 128]
+    stack_to_omezarr.py <slice folder> <out.ome.zarr> [--levels 4] [--voxel-size UM] [--shard 384]
+    stack_to_omezarr.py <in.ome.zarr> <out.ome.zarr> [--levels 4] [--shard 384]
 
 Bruker/SkyScan NRecon folders are read as they are: the voxel size, slice range and file names
 come from the *_rec.log, and the scan settings are written into the store. Any other folder of
@@ -13,7 +13,8 @@ coarser levels are recomputed (its level 0 must be a z, y, x array).
 
 The store is OME-Zarr 0.5 (Zarr v3): one array per level at scale{k}/<name>, 128^3 chunks, zstd,
 millimetre units, origin 0 and identity LPS orientation. --shard N groups the chunks into N^3
-shards (N a multiple of 128); the default, 128, writes every chunk as its own file.
+shards (N a multiple of 128); the default is 384 (see DEFAULT_SHARD for why), and 128 writes
+every chunk as its own file.
 
 Every level is the block mean of the SOURCE voxels it covers (2^k per axis), summed exactly and
 rounded once (half to even) for integer data. Level k is not computed from level k-1: rounding
@@ -38,6 +39,15 @@ import zarr
 from zarr.codecs import ZstdCodec
 
 CHUNK = 128
+# Default shard size, set by the OSN allocation the MorphoDepot stores go to: 50 TB and at most
+# 1.6 million files. An average volume (12 GB at full resolution, 4 levels = 13.7 GB) fills the
+# 50 TB at about 3,650 volumes. Files per such volume (16-bit / 8-bit): 3,964 / 6,718 with plain
+# 128^3 chunks (the file cap is reached at about 400 / 240 volumes), 590 / 894 with 256^3 shards
+# (2,700 / 1,800 volumes), 166 / 257 with 384^3 shards (9,600 / 6,200 volumes). 384 is the smallest
+# shard at which the storage, not the file cap, runs out first; conversion memory grows with the
+# shard (one shard's depth per slab: Scan_0006 needs 1.18 GB at 128, 3.45 GB at 384), so the
+# smallest such shard is the default. Streaming reads single chunks by byte range either way.
+DEFAULT_SHARD = 384
 ORIENTATION = {"x": "right-to-left", "y": "anterior-to-posterior", "z": "inferior-to-superior"}
 
 
@@ -164,7 +174,7 @@ class StoreSource:
         return self.array[z]
 
 
-def convert(source, out, levels=4, shard=CHUNK, log=print):
+def convert(source, out, levels=4, shard=DEFAULT_SHARD, log=print):
     """Write ``source`` (StackSource or StoreSource) to ``out`` with ``levels`` levels, chunks grouped in
     ``shard``^3 shards (``shard`` == CHUNK: no shards, one file per chunk)."""
     if shard < CHUNK or shard % CHUNK:
@@ -277,8 +287,9 @@ def main():
     parser.add_argument("--levels", type=int, default=4, help="resolution levels including full resolution (default 4)")
     parser.add_argument("--voxel-size", type=float, help="voxel size in micrometres (overrides the log)")
     parser.add_argument("--threads", type=int, default=8, help="threads reading slices (default 8)")
-    parser.add_argument("--shard", type=int, default=CHUNK,
-                        help=f"shard size in voxels per side, a multiple of {CHUNK} (default {CHUNK}: no shards, one file per chunk)")
+    parser.add_argument("--shard", type=int, default=DEFAULT_SHARD,
+                        help=f"shard size in voxels per side, a multiple of {CHUNK} (default {DEFAULT_SHARD}; "
+                             f"{CHUNK}: no shards, one file per chunk)")
     parser.add_argument("--no-verify", action="store_true", help="skip the check against the source")
     args = parser.parse_args()
     if args.shard < CHUNK or args.shard % CHUNK:

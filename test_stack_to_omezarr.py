@@ -88,6 +88,16 @@ def test_sharded():
     check(np.uint8, (523, 37, 41), shard=512)  # crosses a 512-slice slab
 
 
+def test_default_shard():
+    with tempfile.TemporaryDirectory() as tmp:
+        source = os.path.join(tmp, "synthetic_Rec")
+        os.mkdir(source)
+        make_stack(source, np.uint16, (20, 30, 25))
+        out = os.path.join(tmp, "synthetic.ome.zarr")
+        conv.convert(conv.StackSource(source), out, levels=2, log=lambda *a: None)
+        assert zarr.open_array(out, path="scale0/synthetic").shards == (conv.DEFAULT_SHARD,) * 3 == (384,) * 3
+
+
 def test_bad_shard():
     try:
         conv.convert(None, "unused", shard=200)
@@ -103,6 +113,7 @@ def test_uint16():
 if __name__ == "__main__":
     test_uint8_odd_shape()
     test_sharded()
+    test_default_shard()
     test_bad_shard()
     test_uint16()
     print("all passed")
